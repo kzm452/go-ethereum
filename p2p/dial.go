@@ -18,8 +18,11 @@ package p2p
 
 import (
 	"context"
+	"crypto/ecdsa"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	mrand "math/rand"
@@ -31,19 +34,14 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
+	"github.com/quic-go/quic-go"
 )
 
 const (
-	// This is the amount of time spent waiting in between redialing a certain node. The
-	// limit is a bit higher than inboundThrottleTime to prevent failing dials in small
-	// private networks.
 	dialHistoryExpiration = inboundThrottleTime + 5*time.Second
+	dialStatsLogInterval  = 10 * time.Second
+	dialStatsPeerLimit    = 3
 
-	// Config for the "Looking for peers" message.
-	dialStatsLogInterval = 10 * time.Second // printed at most this often
-	dialStatsPeerLimit   = 3                // but not if more than this many dialed peers
-
-	// Endpoint resolution is throttled with bounded backoff.
 	initialResolveDelay = 60 * time.Second
 	maxResolveDelay     = time.Hour
 )
@@ -58,14 +56,59 @@ type nodeResolver interface {
 	Resolve(*enode.Node) *enode.Node
 }
 
-// tcpDialer implements NodeDialer using real TCP connections.
 type tcpDialer struct {
-	d *net.Dialer
+	d       *net.Dialer
+	nodeKey *ecdsa.PrivateKey
 }
 
+// p2p/dial.go の tcpDialer.Dial 関数を修正
+
 func (t tcpDialer) Dial(ctx context.Context, dest *enode.Node) (net.Conn, error) {
-	return t.d.DialContext(ctx, "tcp", nodeAddr(dest).String())
+	addr := nodeAddr(dest).String()
+
+	// --- ここから: QUIC を短いデッドラインで試す → ダメなら即 TCP ---
+	ctxQ, cancel := context.WithTimeout(ctx, 750*time.Millisecond) // (タイムアウトは 5s とかに延ばしても良いかもしれません)
+	defer cancel()
+
+	// ▼▼▼ 修正箇所 ▼▼▼
+	tlsConf, err := makeQUICClientTLSConfig(t.nodeKey)
+	if err != nil {
+		// ★★★ エラーログを追加 ★★★
+		log.Error("QUIC client TLS config failed, falling back to TCP", "err", err)
+	} else if tlsConf != nil {
+		// ▲▲▲ 修正箇所 ▲▲▲
+
+		if quicConf := recommendedQUICConfig(); quicConf != nil {
+			// フォールバックを早めるため QUIC 側のアイドルも短く
+			if quicConf.HandshakeIdleTimeout == 0 || quicConf.HandshakeIdleTimeout > 750*time.Millisecond {
+				quicConf.HandshakeIdleTimeout = 750 * time.Millisecond
+			}
+			if qconn, qerr := quic.DialAddr(ctxQ, addr, tlsConf, quicConf); qerr == nil {
+				if stream, serr := qconn.OpenStreamSync(ctxQ); serr == nil {
+					// ... (既存の fingerprint 計算) ...
+					cs := qconn.ConnectionState().TLS
+					var key string
+					if len(cs.PeerCertificates) > 0 {
+						leaf := cs.PeerCertificates[0]
+						sum := sha256.Sum256(leaf.Raw)
+						key = hex.EncodeToString(sum[:])
+					}
+					return newQuicStreamConn(qconn, stream, key), nil
+				}
+				_ = qconn.CloseWithError(0, "stream open failed")
+			} else {
+				// ★★★ QUICダイヤル自体のエラーもログに出力 ★★★
+				log.Error("QUIC dial failed, falling back to TCP", "addr", addr, "err", qerr)
+			}
+		}
+	}
+	// --- ここまで: QUIC 失敗時は必ず TCP にフォールバック ---
+
+	log.Trace("Falling back to TCP dial", "addr", addr) // ★ トレースログ追加
+	return t.d.DialContext(ctx, "tcp", addr)
 }
+
+// ===== 以下は元のdialSchedulerまわり（ほぼそのまま） =====
 
 func nodeAddr(n *enode.Node) net.Addr {
 	return &net.TCPAddr{IP: n.IP(), Port: n.TCP()}

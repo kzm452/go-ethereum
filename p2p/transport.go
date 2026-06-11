@@ -1,3 +1,4 @@
+// p2p/transport.go
 // Copyright 2020 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
@@ -19,6 +20,7 @@ package p2p
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"encoding/binary" // ★ 追加
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p/rlpx"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/golang/snappy"
 )
 
 const (
@@ -44,16 +47,54 @@ const (
 	discWriteTimeout = 1 * time.Second
 )
 
-// rlpxTransport is the transport used by actual (non-test) connections.
-// It wraps an RLPx connection with locks and read/write deadlines.
+type frameConn interface {
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	SetDeadline(t time.Time) error
+	Read() (code uint64, data []byte, wireSize int, err error) // ← int
+	Write(code uint64, data []byte) (uint32, error)            // ← uint32
+	SetSnappy(enable bool)
+	Close() error
+}
+
+// ------------------------------------------------------------
+// rlpxTransport: 従来 *rlpx.Conn だけを持っていたのを、
+// 生ソケット(raw) と frameConn(= rlpx.Conn or plainConn) の2本立てに変更
+// ------------------------------------------------------------
 type rlpxTransport struct {
-	rmu, wmu sync.Mutex
-	wbuf     bytes.Buffer
-	conn     *rlpx.Conn
+	rmu, wmu    sync.Mutex
+	wbuf        bytes.Buffer
+	raw         net.Conn   // ★ 追加: 生の net.Conn
+	conn        frameConn  // ★ 変更: *rlpx.Conn → frameConn
+	rlp         *rlpx.Conn // ★ 追加: 本物の rlpx.Conn（ハンドシェイク時のみ使用）
+	passthrough bool
 }
 
 func newRLPX(conn net.Conn, dialDest *ecdsa.PublicKey) transport {
-	return &rlpxTransport{conn: rlpx.NewConn(conn, dialDest)}
+	r := rlpx.NewConn(conn, dialDest)
+	return &rlpxTransport{
+		raw:  conn, // ★
+		conn: r,    // ★ 最初は rlpx.Conn を使う
+		rlp:  r,    // ★ Handshake 用に保持
+	}
+}
+
+// transport.go（rlpxTransport の宣言付近）
+type plainEnabler interface {
+	ForcePlainFrames()
+}
+
+func (t *rlpxTransport) ForcePlainFrames() {
+	// まずはメソッドを持っているかどうかを動的に確認
+	if pe, ok := t.conn.(interface{ ForcePlainFrames() }); ok {
+		pe.ForcePlainFrames()
+		return
+	}
+	// 念のため: 具体型が *rlpx.Conn のときもハンドル（上と二重になるが安全）
+	if rc, ok := t.conn.(*rlpx.Conn); ok {
+		rc.ForcePlainFrames()
+	}
+	// どちらでもなければ何もしない（no-op）
 }
 
 func (t *rlpxTransport) ReadMsg() (Msg, error) {
@@ -110,26 +151,30 @@ func (t *rlpxTransport) close(err error) {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 
-	// Tell the remote end why we're disconnecting if possible.
-	// We only bother doing this if the underlying connection supports
-	// setting a timeout tough.
+	// Disconnect reason をできるだけ送る（plainConn でも write deadline は設定可）
 	if t.conn != nil {
 		if r, ok := err.(DiscReason); ok && r != DiscNetworkError {
 			deadline := time.Now().Add(discWriteTimeout)
 			if err := t.conn.SetWriteDeadline(deadline); err == nil {
-				// Connection supports write deadline.
 				t.wbuf.Reset()
 				rlp.Encode(&t.wbuf, []DiscReason{r})
 				t.conn.Write(discMsg, t.wbuf.Bytes())
 			}
 		}
+		t.conn.Close()
 	}
-	t.conn.Close()
 }
 
+// ★ 変更点: パススルー時は ECIES 握手をスキップし、plainConn に差し替え
 func (t *rlpxTransport) doEncHandshake(prv *ecdsa.PrivateKey) (*ecdsa.PublicKey, error) {
-	t.conn.SetDeadline(time.Now().Add(handshakeTimeout))
-	return t.conn.Handshake(prv)
+	if t.passthrough {
+		// QUIC(TLS)の上で、RLPx暗号/MACなしのプレーン・フレーミングへ切替
+		t.conn = newPlainConn(t.raw)
+		return nil, nil // remote pubkey は server.go 側で TLS キャッシュから設定
+	}
+	// 通常経路（従来どおり）
+	t.rlp.SetDeadline(time.Now().Add(handshakeTimeout))
+	return t.rlp.Handshake(prv)
 }
 
 func (t *rlpxTransport) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err error) {
@@ -180,4 +225,80 @@ func readProtocolHandshake(rw MsgReader) (*protoHandshake, error) {
 		return nil, DiscInvalidIdentity
 	}
 	return &hs, nil
+}
+
+// パススルー切替フラグ（既存）
+func (t *rlpxTransport) EnablePassthroughMode() { t.passthrough = true }
+func (t *rlpxTransport) IsPassthrough() bool    { return t.passthrough }
+
+// ------------------------------------------------------------
+// ★ 追加: plainConn 実装（RLPx暗号/MACを外し、簡易ヘッダでフレーミング）
+//   ヘッダ: [8B code(uint64 BE)] [4B size(uint32 BE)] + payload
+//   Snappy は既存フラグに従って圧縮/展開
+// ------------------------------------------------------------
+type plainConn struct {
+	c      net.Conn
+	snappy bool
+}
+
+func newPlainConn(c net.Conn) *plainConn { return &plainConn{c: c} }
+
+func (p *plainConn) SetReadDeadline(t time.Time) error  { return p.c.SetReadDeadline(t) }
+func (p *plainConn) SetWriteDeadline(t time.Time) error { return p.c.SetWriteDeadline(t) }
+func (p *plainConn) SetDeadline(t time.Time) error      { return p.c.SetDeadline(t) }
+func (p *plainConn) Close() error                       { return p.c.Close() }
+func (p *plainConn) SetSnappy(enable bool)              { p.snappy = enable }
+
+// Read() の wireSize を uint32 に
+func (p *plainConn) Read() (code uint64, data []byte, wireSize int, err error) {
+	hdr := make([]byte, 12)
+	if _, err = io.ReadFull(p.c, hdr); err != nil {
+		return 0, nil, 0, err
+	}
+	code = binary.BigEndian.Uint64(hdr[0:8])
+	size := binary.BigEndian.Uint32(hdr[8:12])
+	if size > uint32(baseProtocolMaxMsgSize) {
+		return 0, nil, 0, errors.New("plain frame too large")
+	}
+	raw := make([]byte, int(size))
+	if _, err = io.ReadFull(p.c, raw); err != nil {
+		return 0, nil, 0, err
+	}
+	wireSize = 12 + len(raw)
+
+	if p.snappy {
+		dec, derr := snappy.Decode(nil, raw)
+		if derr != nil {
+			return 0, nil, 0, derr
+		}
+		return code, dec, wireSize, nil
+	}
+	return code, raw, wireSize, nil
+}
+
+// Write() の戻り値を uint32 に
+func (p *plainConn) Write(code uint64, payload []byte) (uint32, error) {
+	out := payload
+	if p.snappy {
+		out = snappy.Encode(nil, payload)
+	}
+	if len(out) > baseProtocolMaxMsgSize {
+		return 0, errors.New("plain frame too large")
+	}
+	hdr := make([]byte, 12)
+	binary.BigEndian.PutUint64(hdr[0:8], code)
+	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(out)))
+	if _, err := p.c.Write(hdr); err != nil {
+		return 0, err
+	}
+	if _, err := p.c.Write(out); err != nil {
+		return 0, err
+	}
+	return uint32(len(hdr) + len(out)), nil
+}
+
+// QUICパススルー切替用（rlpxTransport が実装）
+type tlsBindable interface {
+	EnablePassthroughMode()
+	IsPassthrough() bool
 }

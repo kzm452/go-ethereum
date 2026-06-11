@@ -56,6 +56,14 @@ type Conn struct {
 	// Compression is enabled if they are non-nil.
 	snappyReadBuffer  []byte
 	snappyWriteBuffer []byte
+
+	// ADDED: Flag to bypass per-frame crypto if QUIC/TLS is used
+	plainFrames bool
+}
+
+// ADDED: Method to enable plaintext frame mode
+func (c *Conn) ForcePlainFrames() {
+	c.plainFrames = true
 }
 
 // sessionState contains the session keys.
@@ -133,7 +141,8 @@ func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
 		panic("can't ReadMsg before handshake")
 	}
 
-	frame, err := c.session.readFrame(c.conn)
+	// MODIFIED: Pass c.plainFrames flag to session.readFrame
+	frame, err := c.session.readFrame(c.conn, c.plainFrames)
 	if err != nil {
 		return 0, nil, 0, err
 	}
@@ -159,9 +168,42 @@ func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
 	return code, data, wireSize, err
 }
 
-func (h *sessionState) readFrame(conn io.Reader) ([]byte, error) {
+// MODIFIED: Added plainFrames parameter
+func (h *sessionState) readFrame(conn io.Reader, plainFrames bool) ([]byte, error) {
 	h.rbuf.reset()
 
+	// ADDED: Plaintext frame bypass
+	if plainFrames {
+		// --- Plaintext Path ---
+		// 1. Read plaintext header (16 bytes, unencrypted, no MAC).
+		//    RLPxフレーミングの構造（16バイトヘッダ）は維持する
+		header, err := h.rbuf.read(conn, 16)
+		if err != nil {
+			return nil, err
+		}
+		// 2. No MAC verification.
+		// 3. No decryption.
+
+		// 4. Get frame size from plaintext header.
+		fsize := readUint24(header)
+		// 5. Calculate rsize (padded size).
+		rsize := fsize
+		if padding := fsize % 16; padding > 0 {
+			rsize += 16 - padding
+		}
+		// 6. Read the plaintext frame (padded).
+		frame, err := h.rbuf.read(conn, int(rsize))
+		if err != nil {
+			return nil, err
+		}
+		// 7. No frame MAC to read.
+		// 8. No frame MAC to verify.
+		// 9. No frame decryption.
+		return frame[:fsize], nil
+	}
+	// --- END ADDED ---
+
+	// --- Original Encrypted Path ---
 	// Read the frame header.
 	header, err := h.rbuf.read(conn, 32)
 	if err != nil {
@@ -224,18 +266,48 @@ func (c *Conn) Write(code uint64, data []byte) (uint32, error) {
 	}
 
 	wireSize := uint32(len(data))
-	err := c.session.writeFrame(c.conn, code, data)
+	// MODIFIED: Pass c.plainFrames flag to session.writeFrame
+	err := c.session.writeFrame(c.conn, code, data, c.plainFrames)
 	return wireSize, err
 }
 
-func (h *sessionState) writeFrame(conn io.Writer, code uint64, data []byte) error {
+// MODIFIED: Added plainFrames parameter
+func (h *sessionState) writeFrame(conn io.Writer, code uint64, data []byte, plainFrames bool) error {
 	h.wbuf.reset()
 
-	// Write header.
 	fsize := rlp.IntSize(code) + len(data)
 	if fsize > maxUint24 {
 		return errPlainMessageTooLarge
 	}
+
+	// ADDED: Plaintext frame bypass
+	if plainFrames {
+		// --- Plaintext Path ---
+		// 1. Write plaintext header (16 bytes, unencrypted, no MAC).
+		//    RLPxフレーミングの構造（16バイトヘッダ）は維持する
+		header := h.wbuf.appendZero(16)
+		putUint24(uint32(fsize), header)
+		copy(header[3:], zeroHeader)
+		// 2. No encryption (h.enc.XORKeyStream(header, header))
+		// 3. No header MAC (h.wbuf.Write(h.egressMAC.computeHeader(header)))
+
+		// 4. Encode the frame data (code + data + padding).
+		h.wbuf.data = rlp.AppendUint64(h.wbuf.data, code)
+		h.wbuf.Write(data)
+		if padding := fsize % 16; padding > 0 {
+			h.wbuf.appendZero(16 - padding)
+		}
+		// 5. No frame encryption (framedata := ... h.enc.XORKeyStream(framedata, framedata))
+		// 6. No frame MAC (h.wbuf.Write(h.egressMAC.computeFrame(framedata)))
+
+		// 7. Write buffer to connection
+		_, err := conn.Write(h.wbuf.data)
+		return err
+	}
+	// --- END ADDED ---
+
+	// --- Original Encrypted Path ---
+	// Write header.
 	header := h.wbuf.appendZero(16)
 	putUint24(uint32(fsize), header)
 	copy(header[3:], zeroHeader)

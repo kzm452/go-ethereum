@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
+	"github.com/quic-go/quic-go"
 	"golang.org/x/exp/slices"
 )
 
@@ -253,6 +254,14 @@ type transport interface {
 	// the tests. Closing the actual network connection doesn't do
 	// anything in those tests because MsgPipe doesn't use it.
 	close(err error)
+}
+
+func recommendedQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:  20 * time.Second,
+		KeepAlivePeriod: 10 * time.Second,
+		EnableDatagrams: true,
+	}
 }
 
 func (c *conn) String() string {
@@ -472,8 +481,19 @@ func (srv *Server) Start() (err error) {
 		srv.newTransport = newRLPX
 	}
 	if srv.listenFunc == nil {
-		srv.listenFunc = net.Listen
+		srv.listenFunc = func(network, addr string) (net.Listener, error) {
+			tlsConf, err := makeQUICServerTLSConfig(srv.PrivateKey) // (*tls.Config, error)
+			if err != nil {
+				return nil, err
+			}
+			ql, err := quic.ListenAddr(addr, tlsConf, recommendedQUICConfig())
+			if err != nil {
+				return nil, err
+			}
+			return newQuicNetListener(ql), nil
+		}
 	}
+
 	srv.quit = make(chan struct{})
 	srv.delpeer = make(chan peerDrop)
 	srv.checkpointPostHandshake = make(chan *conn)
@@ -500,32 +520,6 @@ func (srv *Server) Start() (err error) {
 
 	srv.loopWG.Add(1)
 	go srv.run()
-	return nil
-}
-
-func (srv *Server) setupLocalNode() error {
-	// Create the devp2p handshake.
-	pubkey := crypto.FromECDSAPub(&srv.PrivateKey.PublicKey)
-	srv.ourHandshake = &protoHandshake{Version: baseProtocolVersion, Name: srv.Name, ID: pubkey[1:]}
-	for _, p := range srv.Protocols {
-		srv.ourHandshake.Caps = append(srv.ourHandshake.Caps, p.cap())
-	}
-	slices.SortFunc(srv.ourHandshake.Caps, Cap.Cmp)
-
-	// Create the local node.
-	db, err := enode.OpenDB(srv.NodeDatabase)
-	if err != nil {
-		return err
-	}
-	srv.nodedb = db
-	srv.localnode = enode.NewLocalNode(db, srv.PrivateKey)
-	srv.localnode.SetFallbackIP(net.IP{127, 0, 0, 1})
-	// TODO: check conflicts
-	for _, p := range srv.Protocols {
-		for _, e := range p.Attributes {
-			srv.localnode.Set(e)
-		}
-	}
 	return nil
 }
 
@@ -606,8 +600,12 @@ func (srv *Server) setupDialScheduler() {
 		config.resolver = srv.ntab
 	}
 	if config.dialer == nil {
-		config.dialer = tcpDialer{&net.Dialer{Timeout: defaultDialTimeout}}
+		config.dialer = tcpDialer{
+			d:       &net.Dialer{Timeout: defaultDialTimeout},
+			nodeKey: srv.PrivateKey,
+		}
 	}
+
 	srv.dialsched = newDialScheduler(config, srv.discmix, srv.SetupConn)
 	for _, n := range srv.StaticNodes {
 		srv.dialsched.addStatic(n)
@@ -642,15 +640,16 @@ func (srv *Server) setupListening() error {
 	srv.listener = listener
 	srv.ListenAddr = listener.Addr().String()
 
-	// Update the local node record and map the TCP listening port if NAT is configured.
-	tcp, isTCP := listener.Addr().(*net.TCPAddr)
-	if isTCP {
-		srv.localnode.Set(enr.TCP(tcp.Port))
-		if !tcp.IP.IsLoopback() && !tcp.IP.IsPrivate() {
+	if udp, ok := listener.Addr().(*net.UDPAddr); ok {
+		// ENRのTCPフィールドとしてQUICのポートを載せてしまう
+		srv.localnode.Set(enr.TCP(udp.Port))
+
+		// NAT開けるならこっちもUDPで投げるようにしておくと親切
+		if !udp.IP.IsLoopback() && !udp.IP.IsPrivate() {
 			srv.portMappingRegister <- &portMapping{
-				protocol: "TCP",
-				name:     "ethereum p2p",
-				port:     tcp.Port,
+				protocol: "UDP",
+				name:     "ethereum p2p (quic)",
+				port:     udp.Port,
 			}
 		}
 	}
@@ -947,6 +946,12 @@ func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *enode.Node) 
 	return err
 }
 
+type quicKeyer interface {
+	GetVerifiedNodeIDKey() string
+}
+
+// p2p/server.go の setupConn 関数 (これが正しいハイブリッド版です)
+
 func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) error {
 	// Prevent leftover pending conns from entering the handshake.
 	srv.lock.Lock()
@@ -956,27 +961,66 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) erro
 		return errServerStopped
 	}
 
-	// If dialing, figure out the remote public key.
+	// If dialing, figure out the remote public key exists in enode.
 	if dialDest != nil {
 		dialPubkey := new(ecdsa.PublicKey)
 		if err := dialDest.Load((*enode.Secp256k1)(dialPubkey)); err != nil {
-			err = fmt.Errorf("%w: dial destination doesn't have a secp256k1 public key", errEncHandshakeError)
+			err := fmt.Errorf("%w: dial destination doesn't have a secp256k1 public key", errEncHandshakeError)
 			srv.log.Trace("Setting up connection failed", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
 			return err
 		}
 	}
 
-	// Run the RLPx handshake.
-	remotePubkey, err := c.doEncHandshake(srv.PrivateKey)
+	// --- QUIC/TLS側で検証済みの公開鍵（tlsPub）があれば取得を試みる ---
+	// (quicKeyProvider は quic_conn.go で定義されているはず)
+	type quicKeyProvider interface{ GetVerifiedNodeIDKey() string }
+	var tlsPub *ecdsa.PublicKey // QUIC/TLSで検証した公開鍵
+
+	if q, ok := c.fd.(quicKeyProvider); ok {
+		if key := q.GetVerifiedNodeIDKey(); key == "" {
+			srv.log.Trace("QUIC tlsbind: no peer cert; falling back to RLPx", "addr", c.fd.RemoteAddr())
+		} else if p, ok := LoadAndRemoveVerifiedNodeID(key); ok {
+			// tlsbind 成功 → tlsPub に保持
+			tlsPub = p
+			srv.log.Trace("QUIC tlsbind: verified node id", "addr", c.fd.RemoteAddr())
+		} else {
+			srv.log.Trace("QUIC tlsbind: unknown key; falling back to RLPx", "addr", c.fd.RemoteAddr(), "key", key)
+		}
+	}
+
+	// === 1. RLPx暗号ハンドシェイクを「常に」実行 (panic回避) ===
+	// (doEncHandshake は transport.go を経由して rlpx.Conn.Handshake() を呼ぶ)
+	remotePub, err := c.doEncHandshake(srv.PrivateKey)
 	if err != nil {
 		srv.log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
 		return fmt.Errorf("%w: %v", errEncHandshakeError, err)
 	}
+
+	// === 2. 一致検証 (もしtlsPubが取れていたら) ===
+	if tlsPub != nil && (tlsPub.X.Cmp(remotePub.X) != 0 || tlsPub.Y.Cmp(remotePub.Y) != 0) {
+		srv.log.Trace("tlsPub != rlpx remotePub; reject", "addr", c.fd.RemoteAddr())
+		return DiscUnexpectedIdentity
+	}
+
+	// === 3. フレーム暗号OFFに切替 (もしtlsPubが取れていたら) ===
+	if tlsPub != nil {
+		// (plainEnabler は transport.go で定義されているはず)
+		if pe, ok := c.transport.(interface{ ForcePlainFrames() }); ok {
+			pe.ForcePlainFrames() // これが rlpx.Conn.ForcePlainFrames() を呼び出す
+			srv.log.Trace("RLPx frame crypto disabled (QUIC/TLS in use)", "addr", c.fd.RemoteAddr())
+		}
+	}
+	// (tlsPub == nil の場合は、二重暗号化のまま続行される)
+
+	// ★★★ c.node を必ず設定する ★★★
 	if dialDest != nil {
 		c.node = dialDest
 	} else {
-		c.node = nodeFromConn(remotePubkey, c.fd)
+		// (nodeFromConn は UDPAddr に対応済みのはず)
+		c.node = nodeFromConn(remotePub, c.fd)
 	}
+
+	// checkpointPostHandshake を RLPx の直後に移動 (v1.13.15 の構造に合わせる)
 	clog := srv.log.New("id", c.node.ID(), "addr", c.fd.RemoteAddr(), "conn", c.flags)
 	err = srv.checkpoint(c, srv.checkpointPostHandshake)
 	if err != nil {
@@ -984,33 +1028,41 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) erro
 		return err
 	}
 
-	// Run the capability negotiation handshake.
+	// --- devp2p プロトコル・ハンドシェイク ---
 	phs, err := c.doProtoHandshake(srv.ourHandshake)
 	if err != nil {
-		clog.Trace("Failed p2p handshake", "err", err)
+		srv.log.Trace("Failed p2p handshake", "err", err)
 		return fmt.Errorf("%w: %v", errProtoHandshakeError, err)
 	}
 	if id := c.node.ID(); !bytes.Equal(crypto.Keccak256(phs.ID), id[:]) {
-		clog.Trace("Wrong devp2p handshake identity", "phsid", hex.EncodeToString(phs.ID))
+		srv.log.Trace("Wrong devp2p handshake identity", "phsid", hex.EncodeToString(phs.ID))
 		return DiscUnexpectedIdentity
 	}
 	c.caps, c.name = phs.Caps, phs.Name
+
+	// checkpointAddPeer を devp2p の後に移動
 	err = srv.checkpoint(c, srv.checkpointAddPeer)
 	if err != nil {
 		clog.Trace("Rejected peer", "err", err)
 		return err
 	}
-
 	return nil
 }
 
+// QUICで来た inbound もちゃんと enode を作れるようにする
 func nodeFromConn(pubkey *ecdsa.PublicKey, conn net.Conn) *enode.Node {
 	var ip net.IP
 	var port int
-	if tcp, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-		ip = tcp.IP
-		port = tcp.Port
+
+	switch addr := conn.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		ip = addr.IP
+		port = addr.Port
+	case *net.UDPAddr: // QUIC はこちら
+		ip = addr.IP
+		port = addr.Port
 	}
+
 	return enode.NewV4(pubkey, ip, port, port)
 }
 
@@ -1131,4 +1183,27 @@ func (srv *Server) PeersInfo() []*PeerInfo {
 		}
 	}
 	return infos
+}
+
+func (srv *Server) setupLocalNode() error {
+	pubkey := crypto.FromECDSAPub(&srv.PrivateKey.PublicKey)
+	srv.ourHandshake = &protoHandshake{Version: baseProtocolVersion, Name: srv.Name, ID: pubkey[1:]}
+	for _, p := range srv.Protocols {
+		srv.ourHandshake.Caps = append(srv.ourHandshake.Caps, p.cap())
+	}
+	slices.SortFunc(srv.ourHandshake.Caps, Cap.Cmp)
+
+	db, err := enode.OpenDB(srv.NodeDatabase)
+	if err != nil {
+		return err
+	}
+	srv.nodedb = db
+	srv.localnode = enode.NewLocalNode(db, srv.PrivateKey)
+	srv.localnode.SetFallbackIP(net.IP{127, 0, 0, 1})
+	for _, p := range srv.Protocols {
+		for _, e := range p.Attributes {
+			srv.localnode.Set(e)
+		}
+	}
+	return nil
 }
